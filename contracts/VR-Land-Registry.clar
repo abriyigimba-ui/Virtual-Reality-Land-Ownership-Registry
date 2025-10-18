@@ -13,6 +13,10 @@
 (define-constant err-parcel-locked (err u108))
 (define-constant err-invalid-price (err u109))
 (define-constant err-community-not-found (err u110))
+(define-constant err-parcel-rented (err u111))
+(define-constant err-rental-not-found (err u112))
+(define-constant err-rental-expired (err u113))
+(define-constant err-not-renter (err u114))
 
 (define-data-var next-parcel-id uint u1)
 (define-data-var total-parcels uint u0)
@@ -76,6 +80,27 @@
     description: (string-ascii 256),
     creator: principal,
     created-at: uint
+  }
+)
+
+(define-map parcel-rentals
+  uint
+  {
+    renter: principal,
+    rental-price: uint,
+    start-block: uint,
+    end-block: uint,
+    owner: principal
+  }
+)
+
+(define-map rental-offers
+  uint
+  {
+    price-per-block: uint,
+    max-duration: uint,
+    owner: principal,
+    active: bool
   }
 )
 
@@ -222,6 +247,79 @@
   )
 )
 
+(define-public (offer-rental (parcel-id uint) (price-per-block uint) (max-duration uint))
+  (let
+    (
+      (parcel (unwrap! (map-get? parcel-data parcel-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? vr-land parcel-id) err-not-found)) err-not-owner)
+    (asserts! (not (get is-locked parcel)) err-parcel-locked)
+    (asserts! (is-none (map-get? parcel-rentals parcel-id)) err-parcel-rented)
+    (asserts! (> price-per-block u0) err-invalid-price)
+    (asserts! (> max-duration u0) err-invalid-coordinates)
+    (map-set rental-offers parcel-id
+      {
+        price-per-block: price-per-block,
+        max-duration: max-duration,
+        owner: tx-sender,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (rent-parcel (parcel-id uint) (duration uint))
+  (let
+    (
+      (offer (unwrap! (map-get? rental-offers parcel-id) err-rental-not-found))
+      (parcel (unwrap! (map-get? parcel-data parcel-id) err-not-found))
+      (total-cost (* (get price-per-block offer) duration))
+      (owner (get owner offer))
+    )
+    (asserts! (get active offer) err-rental-not-found)
+    (asserts! (<= duration (get max-duration offer)) err-invalid-coordinates)
+    (asserts! (is-none (map-get? parcel-rentals parcel-id)) err-parcel-rented)
+    (asserts! (>= (stx-get-balance tx-sender) total-cost) err-invalid-price)
+    (try! (stx-transfer? total-cost tx-sender owner))
+    (map-set parcel-rentals parcel-id
+      {
+        renter: tx-sender,
+        rental-price: total-cost,
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height duration),
+        owner: owner
+      }
+    )
+    (map-set rental-offers parcel-id (merge offer { active: false }))
+    (ok true)
+  )
+)
+
+(define-public (end-rental (parcel-id uint))
+  (let
+    (
+      (rental (unwrap! (map-get? parcel-rentals parcel-id) err-rental-not-found))
+    )
+    (asserts! (or (is-eq tx-sender (get renter rental)) (is-eq tx-sender (get owner rental))) err-not-renter)
+    (asserts! (>= stacks-block-height (get end-block rental)) err-rental-expired)
+    (map-delete parcel-rentals parcel-id)
+    (ok true)
+  )
+)
+
+(define-public (cancel-rental-offer (parcel-id uint))
+  (let
+    (
+      (offer (unwrap! (map-get? rental-offers parcel-id) err-rental-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner offer)) err-not-owner)
+    (asserts! (is-none (map-get? parcel-rentals parcel-id)) err-parcel-rented)
+    (map-set rental-offers parcel-id (merge offer { active: false }))
+    (ok true)
+  )
+)
+
 (define-private (update-member-reputation (community-id uint) (member principal) (points uint))
   (let
     (
@@ -275,6 +373,31 @@
 
 (define-read-only (get-total-parcels)
   (var-get total-parcels)
+)
+
+(define-read-only (get-rental-info (parcel-id uint))
+  (map-get? parcel-rentals parcel-id)
+)
+
+(define-read-only (get-rental-offer (parcel-id uint))
+  (map-get? rental-offers parcel-id)
+)
+
+(define-read-only (is-rental-active (parcel-id uint))
+  (match (map-get? parcel-rentals parcel-id)
+    rental (< stacks-block-height (get end-block rental))
+    false
+  )
+)
+
+(define-read-only (can-use-parcel (parcel-id uint) (user principal))
+  (or
+    (is-eq user (unwrap! (nft-get-owner? vr-land parcel-id) false))
+    (match (map-get? parcel-rentals parcel-id)
+      rental (and (is-eq user (get renter rental)) (< stacks-block-height (get end-block rental)))
+      false
+    )
+  )
 )
 
 (define-private (check-parcel-coordinates (parcel-id uint) (found (optional uint)))
