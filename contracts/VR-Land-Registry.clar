@@ -83,6 +83,43 @@
   }
 )
 
+(define-public (register-world (world-id (string-ascii 32)) (name (string-ascii 64)) (description (string-ascii 256)))
+  (let
+    (
+      (existing (map-get? world-metadata world-id))
+    )
+    (asserts! (is-none existing) err-already-exists)
+    (asserts! (> (len name) u0) err-invalid-coordinates)
+    (map-set world-metadata world-id
+      {
+        name: name,
+        description: description,
+        creator: tx-sender,
+        created-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-world-metadata (world-id (string-ascii 32)) (name (string-ascii 64)) (description (string-ascii 256)))
+  (let
+    (
+      (world (unwrap! (map-get? world-metadata world-id) err-community-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator world)) err-owner-only)
+    (map-set world-metadata world-id
+      {
+        name: name,
+        description: description,
+        creator: (get creator world),
+        created-at: (get created-at world)
+      }
+    )
+    (ok true)
+  )
+)
+
 (define-map parcel-rentals
   uint
   {
