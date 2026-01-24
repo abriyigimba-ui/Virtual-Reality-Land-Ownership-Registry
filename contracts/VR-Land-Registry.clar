@@ -17,6 +17,11 @@
 (define-constant err-rental-not-found (err u112))
 (define-constant err-rental-expired (err u113))
 (define-constant err-not-renter (err u114))
+(define-constant err-auction-not-found (err u115))
+(define-constant err-auction-ended (err u116))
+(define-constant err-bid-too-low (err u117))
+(define-constant err-auction-active (err u118))
+(define-constant err-not-highest-bidder (err u119))
 
 (define-data-var next-parcel-id uint u1)
 (define-data-var total-parcels uint u0)
@@ -139,6 +144,24 @@
     owner: principal,
     active: bool
   }
+)
+
+(define-map parcel-auctions
+  uint
+  {
+    seller: principal,
+    start-price: uint,
+    current-bid: uint,
+    highest-bidder: (optional principal),
+    start-block: uint,
+    end-block: uint,
+    min-increment: uint
+  }
+)
+
+(define-map auction-escrow
+  { parcel-id: uint, bidder: principal }
+  uint
 )
 
 (define-public (mint-parcel (x-coord int) (y-coord int) (z-coord int) (world-id (string-ascii 32)) (size uint) (community-id uint))
@@ -357,6 +380,114 @@
   )
 )
 
+(define-public (create-auction (parcel-id uint) (start-price uint) (duration uint) (min-increment uint))
+  (let
+    (
+      (parcel (unwrap! (map-get? parcel-data parcel-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? vr-land parcel-id) err-not-found)) err-not-owner)
+    (asserts! (not (get is-locked parcel)) err-parcel-locked)
+    (asserts! (> start-price u0) err-invalid-price)
+    (asserts! (> duration u0) err-invalid-coordinates)
+    (asserts! (is-none (map-get? parcel-auctions parcel-id)) err-auction-active)
+    (asserts! (is-none (map-get? marketplace-listings parcel-id)) err-already-exists)
+    (map-set parcel-auctions parcel-id
+      {
+        seller: tx-sender,
+        start-price: start-price,
+        current-bid: u0,
+        highest-bidder: none,
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height duration),
+        min-increment: min-increment
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (place-bid (parcel-id uint) (bid-amount uint))
+  (let
+    (
+      (auction (unwrap! (map-get? parcel-auctions parcel-id) err-auction-not-found))
+      (current-bid (get current-bid auction))
+      (min-bid (if (is-eq current-bid u0)
+                  (get start-price auction)
+                  (+ current-bid (get min-increment auction))))
+      (previous-bidder (get highest-bidder auction))
+    )
+    (asserts! (< stacks-block-height (get end-block auction)) err-auction-ended)
+    (asserts! (>= bid-amount min-bid) err-bid-too-low)
+    (asserts! (>= (stx-get-balance tx-sender) bid-amount) err-invalid-price)
+    (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+    (match previous-bidder
+      prev-bidder (let
+        (
+          (prev-escrow (default-to u0 (map-get? auction-escrow { parcel-id: parcel-id, bidder: prev-bidder })))
+        )
+        (if (> prev-escrow u0)
+          (begin
+            (try! (as-contract (stx-transfer? prev-escrow tx-sender prev-bidder)))
+            (map-delete auction-escrow { parcel-id: parcel-id, bidder: prev-bidder })
+          )
+          true
+        )
+      )
+      true
+    )
+    (map-set auction-escrow { parcel-id: parcel-id, bidder: tx-sender } bid-amount)
+    (map-set parcel-auctions parcel-id (merge auction { current-bid: bid-amount, highest-bidder: (some tx-sender) }))
+    (ok true)
+  )
+)
+
+(define-public (finalize-auction (parcel-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? parcel-auctions parcel-id) err-auction-not-found))
+      (winner (unwrap! (get highest-bidder auction) err-not-found))
+      (final-bid (get current-bid auction))
+      (seller (get seller auction))
+      (parcel (unwrap! (map-get? parcel-data parcel-id) err-not-found))
+    )
+    (asserts! (>= stacks-block-height (get end-block auction)) err-auction-active)
+    (asserts! (> final-bid u0) err-bid-too-low)
+    (try! (as-contract (stx-transfer? final-bid tx-sender seller)))
+    (try! (nft-transfer? vr-land parcel-id seller winner))
+    (map-delete auction-escrow { parcel-id: parcel-id, bidder: winner })
+    (map-delete parcel-auctions parcel-id)
+    (update-member-reputation (get community-id parcel) winner u10)
+    (ok true)
+  )
+)
+
+(define-public (cancel-auction (parcel-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? parcel-auctions parcel-id) err-auction-not-found))
+      (highest-bidder (get highest-bidder auction))
+    )
+    (asserts! (is-eq tx-sender (get seller auction)) err-not-owner)
+    (match highest-bidder
+      bidder (let
+        (
+          (escrow-amount (default-to u0 (map-get? auction-escrow { parcel-id: parcel-id, bidder: bidder })))
+        )
+        (if (> escrow-amount u0)
+          (begin
+            (try! (as-contract (stx-transfer? escrow-amount tx-sender bidder)))
+            (map-delete auction-escrow { parcel-id: parcel-id, bidder: bidder })
+          )
+          true
+        )
+      )
+      true
+    )
+    (map-delete parcel-auctions parcel-id)
+    (ok true)
+  )
+)
+
 (define-private (update-member-reputation (community-id uint) (member principal) (points uint))
   (let
     (
@@ -444,5 +575,29 @@
       parcel-info none
       none
     )
+  )
+)
+
+(define-read-only (get-auction-info (parcel-id uint))
+  (map-get? parcel-auctions parcel-id)
+)
+
+(define-read-only (get-auction-escrow (parcel-id uint) (bidder principal))
+  (default-to u0 (map-get? auction-escrow { parcel-id: parcel-id, bidder: bidder }))
+)
+
+(define-read-only (is-auction-active (parcel-id uint))
+  (match (map-get? parcel-auctions parcel-id)
+    auction (< stacks-block-height (get end-block auction))
+    false
+  )
+)
+
+(define-read-only (get-minimum-bid (parcel-id uint))
+  (match (map-get? parcel-auctions parcel-id)
+    auction (if (is-eq (get current-bid auction) u0)
+              (get start-price auction)
+              (+ (get current-bid auction) (get min-increment auction)))
+    u0
   )
 )
